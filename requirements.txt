@@ -4,3 +4,5 @@ node2vec
 scikit-learn 
 matplotlib 
 networkx
+matplotlib
+python-louvain
