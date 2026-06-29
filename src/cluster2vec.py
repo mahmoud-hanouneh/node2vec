@@ -92,15 +92,15 @@ def embeddings_to_matrix(model, N, d):
     return X
 
 
-def plot_tsne(X, y, title, path, seed):
-    coords = TSNE(n_components=2, init="pca", learning_rate="auto",
-                  random_state=seed).fit_transform(X)
-    plt.figure(figsize=(7, 6))
-    sc = plt.scatter(coords[:, 0], coords[:, 1], c=y, s=8, cmap="tab10", alpha=0.8)
-    plt.legend(*sc.legend_elements(), title="class", loc="best", fontsize=8)
-    plt.title(title); plt.xticks([]); plt.yticks([]); plt.tight_layout()
-    plt.savefig(path, dpi=150); plt.close()
-    print(f"[tsne] saved -> {path}")
+# def plot_tsne(X, y, title, path, seed):
+#     coords = TSNE(n_components=2, init="pca", learning_rate="auto",
+#                   random_state=seed).fit_transform(X)
+#     plt.figure(figsize=(7, 6))
+#     sc = plt.scatter(coords[:, 0], coords[:, 1], c=y, s=8, cmap="tab10", alpha=0.8)
+#     plt.legend(*sc.legend_elements(), title="class", loc="best", fontsize=8)
+#     plt.title(title); plt.xticks([]); plt.yticks([]); plt.tight_layout()
+#     plt.savefig(path, dpi=150); plt.close()
+#     print(f"[tsne] saved -> {path}")
 
 
 # 1) Hierarchical clustering (Louvain dendrogram)
@@ -168,15 +168,62 @@ class ClusterBiasedNode2Vec(Node2Vec):
         super().__init__(biased, weight_key=weight_key, **kwargs)
 
 
+def build_methods():
+    """Return an ordered list of (label, builder) pairs."""
+    methods = []
+    methods.append(("baseline",
+                    lambda G, lm, c: Node2Vec(G, **c)))
+    methods.append(("cluster-flat (1.25/1.0)",
+                    lambda G, lm, c: ClusterBiasedNode2Vec(
+                        G, lm, beta_in=1.25, beta_out=1.0, mode="flat", **c)))
+    methods.append(("cluster-multiscale (1.5/1.0)",
+                    lambda G, lm, c: ClusterBiasedNode2Vec(
+                        G, lm, beta_in=1.5, beta_out=1.0, mode="multiscale", **c)))
+    methods.append(("cluster-flat (2.0/0.5)",
+                    lambda G, lm, c: ClusterBiasedNode2Vec(
+                        G, lm, beta_in=2.0, beta_out=0.5, mode="flat", **c)))
+    return methods
+
+
+def plot_tsne_grid(variants, y, path, dataset, seed):
+    """variants: list of (label, acc, X). Draw a grid of t-SNE scatter panels."""
+    n = len(variants)
+    cols = 2
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(7 * cols, 6 * rows))
+    axes = np.array(axes).reshape(-1)
+
+    for ax, (label, acc, X) in zip(axes, variants):
+        print(f"[tsne] projecting '{label}' ...")
+        coords = TSNE(n_components=2, init="pca", learning_rate="auto",
+                      random_state=seed).fit_transform(X)
+        sc = ax.scatter(coords[:, 0], coords[:, 1], c=y, s=6, cmap="tab10", alpha=0.8)
+        ax.set_title(f"{label}\nacc={acc:.3f}", fontsize=11)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    for ax in axes[n:]:          # hide any unused panel
+        ax.axis("off")
+
+    handles, labels = sc.legend_elements()
+    fig.legend(handles, labels, title="class", loc="upper right", fontsize=8)
+    fig.suptitle(f"{dataset}: node2vec vs cluster-biased variants "
+                 f"(t-SNE, seed={seed})", fontsize=14)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[tsne] grid saved -> {path}")
+
+
+
 # --------------------------------------------------------------------------- #
 # Runners
 # --------------------------------------------------------------------------- #
-def fit_and_eval(n2v_obj, G, y, train_mask, test_mask, dims, window, seed, label):
-    model = n2v_obj.fit(window=window, min_count=1, sg=1, seed=seed, workers=1)
-    X = embeddings_to_matrix(model, G.number_of_nodes(), dims)
-    acc = evaluate(X, y, train_mask, test_mask, seed)
-    print(f"[eval] {label:<34} test acc = {acc:.4f}")
-    return acc, X
+# def fit_and_eval(n2v_obj, G, y, train_mask, test_mask, dims, window, seed, label):
+#     model = n2v_obj.fit(window=window, min_count=1, sg=1, seed=seed, workers=1)
+#     X = embeddings_to_matrix(model, G.number_of_nodes(), dims)
+#     acc = evaluate(X, y, train_mask, test_mask, seed)
+#     print(f"[eval] {label:<34} test acc = {acc:.4f}")
+#     return acc, X
 
 
 def main():
@@ -188,71 +235,135 @@ def main():
     ap.add_argument("--window", type=int, default=10)
     ap.add_argument("--p", type=float, default=1.0)
     ap.add_argument("--q", type=float, default=1.0)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     ap.add_argument("--outdir", default="results")
     args = ap.parse_args()
 
-    set_seed(args.seed)
     os.makedirs(args.outdir, exist_ok=True)
+    methods = build_methods()
 
-    G, y, train_mask, test_mask = load_planetoid(args.dataset)
-    level_maps = compute_louvain_levels(G, args.seed)
+    # accuracies[label] = list of per-seed test accuracies
+    accuracies = {label: [] for label, _ in methods}
+    grid_variants = []   # filled on the first seed for the t-SNE grid
 
-    common = dict(dimensions=args.dimensions, walk_length=args.walk_length,
-                  num_walks=args.num_walks, p=args.p, q=args.q,
-                  workers=1, seed=args.seed, quiet=True)
+    for si, seed in enumerate(args.seeds):
+        print(f"\n############## SEED {seed} ({si + 1}/{len(args.seeds)}) ##############")
+        set_seed(seed)
+        G, y, train_mask, test_mask = load_planetoid(args.dataset)
+        level_maps = compute_louvain_levels(G, seed)
 
-    results, best = [], {"acc": -1, "label": None, "X": None}
+        common = dict(dimensions=args.dimensions, walk_length=args.walk_length,
+                      num_walks=args.num_walks, p=args.p, q=args.q,
+                      workers=1, seed=seed, quiet=True)
 
-    # (0) plain node2vec baseline
-    print("\n=== baseline node2vec (no cluster bias) ===")
-    base = Node2Vec(G, **common)
-    acc, X = fit_and_eval(base, G, y, train_mask, test_mask,
-                          args.dimensions, args.window, args.seed,
-                          "baseline node2vec")
-    results.append(("baseline", "-", "-", acc))
-    best = {"acc": acc, "label": "baseline", "X": X}
+        for label, builder in methods:
+            n2v = builder(G, level_maps, common)
+            model = n2v.fit(window=args.window, min_count=1, sg=1,
+                            seed=seed, workers=1)
+            X = embeddings_to_matrix(model, G.number_of_nodes(), args.dimensions)
+            acc = evaluate(X, y, train_mask, test_mask, seed)
+            accuracies[label].append(acc)
+            print(f"[eval] seed={seed}  {label:<32} acc = {acc:.4f}")
+            if si == 0:                      # keep first-seed embeddings to plot
+                grid_variants.append((label, acc, X))
+
+
+        # ---- summary: mean +/- std ------------------------------------------- #
+    print("\n================ SUMMARY: " + args.dataset +
+          f"  ({len(args.seeds)} seeds) ================")
+    print(f"{'method':<32}{'mean':>9}{'std':>9}{'min':>9}{'max':>9}")
+    stats = {}
+    for label, _ in methods:
+        a = np.array(accuracies[label])
+        mean = a.mean()
+        std = a.std(ddof=1) if len(a) > 1 else 0.0
+        stats[label] = (mean, std)
+        print(f"{label:<32}{mean:>9.4f}{std:>9.4f}{a.min():>9.4f}{a.max():>9.4f}")
+
+
+    # # (0) plain node2vec baseline
+    # print("\n=== baseline node2vec (no cluster bias) ===")
+    # base = Node2Vec(G, **common)
+    # acc, X = fit_and_eval(base, G, y, train_mask, test_mask,
+    #                       args.dimensions, args.window, args.seed,
+    #                       "baseline node2vec")
+    # results.append(("baseline", "-", "-", acc))
+    # best = {"acc": acc, "label": "baseline", "X": X}
 
     # (1) cluster-biased variants 
     
-    configs = [
-        ("flat",       1.25, 1.0),   # gentle: only prompt the walk to stay
-        ("multiscale", 1.5,  1.0),   # gentle, multi-scale (deep cluster -> stronger)
-        ("flat",       2.0,  0.5),   # aggressive: over-confines -> usually worse
-    ]
-    for mode, b_in, b_out in configs:
+    base_mean, base_std = stats["baseline"]
+    print("\n---- verdict (vs baseline) ----")
+    for label, _ in methods:
+        if label == "baseline":
+            continue
+        mean, std = stats[label]
+        diff = mean - base_mean
+        # "within noise" if the gap is smaller than the seeds' own spread
+        noise = max(base_std, std, 1e-9)
+        tag = "within noise" if abs(diff) <= noise else ("BETTER" if diff > 0 else "WORSE")
+        print(f"{label:<32} diff = {diff:+.4f}   ({tag})")
 
-        label = f"cluster-{mode} (in={b_in}, out={b_out})"
+    
+    # CSV Results
+    per_seed = os.path.join(args.outdir, f"{args.dataset}_idea_a_perseed.csv")
+    with open(per_seed, "w") as f:
+        f.write("dataset,method,seed,test_accuracy\n")
+        for label, _ in methods:
+            for seed, acc in zip(args.seeds, accuracies[label]):
+                f.write(f"{args.dataset},{label},{seed},{acc:.4f}\n")
+    summary = os.path.join(args.outdir, f"{args.dataset}_idea_a_summary.csv")
+    with open(summary, "w") as f:
+        f.write("dataset,method,mean_acc,std_acc,n_seeds\n")
+        for label, _ in methods:
+            mean, std = stats[label]
+            f.write(f"{args.dataset},{label},{mean:.4f},{std:.4f},{len(args.seeds)}\n")
+    print(f"\n[save] per-seed  -> {per_seed}")
+    print(f"[save] summary   -> {summary}")
 
-        print(f"\n=== {label} ===")
-        cb = ClusterBiasedNode2Vec(G, level_maps, beta_in=b_in, beta_out=b_out,
-                                   mode=mode, **common)
-        acc, X = fit_and_eval(cb, G, y, train_mask, test_mask,
-                              args.dimensions, args.window, args.seed, label)
-        results.append((f"cluster-{mode}", b_in, b_out, acc))
-        if acc > best["acc"]:
-            best = {"acc": acc, "label": label, "X": X}
+    # t-SNE grid (first seed)
+    grid_path = os.path.join(args.outdir, f"{args.dataset}_idea_a_tsne_grid.png")
+    plot_tsne_grid(grid_variants, y, grid_path, args.dataset, args.seeds[0])
+
+    print("\nFinished.")
+    # configs = [
+    #     ("flat",       1.25, 1.0),   # gentle: only prompt the walk to stay
+    #     ("multiscale", 1.5,  1.0),   # gentle, multi-scale (deep cluster -> stronger)
+    #     ("flat",       2.0,  0.5),   # aggressive: over-confines -> usually worse
+    # ]
+    # for mode, b_in, b_out in configs:
+
+    #     label = f"cluster-{mode} (in={b_in}, out={b_out})"
+
+    #     print(f"\n=== {label} ===")
+    #     cb = ClusterBiasedNode2Vec(G, level_maps, beta_in=b_in, beta_out=b_out,
+    #                                mode=mode, **common)
+    #     acc, X = fit_and_eval(cb, G, y, train_mask, test_mask,
+    #                           args.dimensions, args.window, args.seed, label)
+    #     results.append((f"cluster-{mode}", b_in, b_out, acc))
+    #     if acc > best["acc"]:
+    #         best = {"acc": acc, "label": label, "X": X}
 
     # summary in a table
-    print("\n================ SUMMARY (" + args.dataset + ") ================")
-    print(f"{'method':<18}{'beta_in':>9}{'beta_out':>10}{'test_acc':>11}")
-    for method, bi, bo, acc in results:
-        print(f"{method:<18}{str(bi):>9}{str(bo):>10}{acc:>11.4f}")
+    # print("\n================ SUMMARY (" + args.dataset + ") ================")
+    # print(f"{'method':<18}{'beta_in':>9}{'beta_out':>10}{'test_acc':>11}")
+    # for method, bi, bo, acc in results:
+    #     print(f"{method:<18}{str(bi):>9}{str(bo):>10}{acc:>11.4f}")
 
-    csv_path = os.path.join(args.outdir, f"{args.dataset}_idea_a.csv")
-    with open(csv_path, "w") as f:
-        f.write("dataset,method,beta_in,beta_out,test_accuracy\n")
-        for method, bi, bo, acc in results:
-            f.write(f"{args.dataset},{method},{bi},{bo},{acc:.4f}\n")
-    print(f"\n[save] results -> {csv_path}")
+    # csv_path = os.path.join(args.outdir, f"{args.dataset}_idea_a.csv")
+    # with open(csv_path, "w") as f:
+    #     f.write("dataset,method,beta_in,beta_out,test_accuracy\n")
+    #     for method, bi, bo, acc in results:
+    #         f.write(f"{args.dataset},{method},{bi},{bo},{acc:.4f}\n")
+    # print(f"\n[save] results -> {csv_path}")
 
-    tsne_path = os.path.join(args.outdir, f"{args.dataset}_idea_a_best.png")
-    plot_tsne(best["X"], y,
-              title=f"{args.dataset} {best['label']} (acc={best['acc']:.3f})",
-              path=tsne_path, seed=args.seed)
+    # tsne_path = os.path.join(args.outdir, f"{args.dataset}_idea_a_best.png")
+    # plot_tsne(best["X"], y,
+    #           title=f"{args.dataset} {best['label']} (acc={best['acc']:.3f})",
+    #           path=tsne_path, seed=args.seed)
 
-    print(f"\nDone. Best on {args.dataset}: {best['label']} "
-          f"= {best['acc']:.4f}")
+    # print(f"\nDone. Best on {args.dataset}: {best['label']} "
+    #       f"= {best['acc']:.4f}")
 
 
 if __name__ == "__main__":
